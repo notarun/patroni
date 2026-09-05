@@ -102,7 +102,7 @@ Available dependency extras:
 
 - ``etcd`` or ``etcd3``: `python-etcd` for Etcd as DCS
 - ``consul``: `py-consul` for Consul as DCS
-- ``nomad``: no additional Python package is required
+- ``nomad``: `requests` and `requests-unixsocket` for Nomad as DCS
 - ``zookeeper``: `kazoo` for ZooKeeper as DCS
 - ``exhibitor``: `kazoo` for Exhibitor as DCS
 - ``kubernetes``: `kubernetes` for Kubernetes as DCS

@@ -16,7 +16,6 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import psutil
-import urllib3
 import yaml
 
 import patroni.psycopg as psycopg
@@ -504,20 +503,18 @@ class NomadController(AbstractDcsController):
         super(NomadController, self).__init__(context)
         os.environ['PATRONI_NOMAD_HOST'] = 'localhost:4646'
         os.environ['PATRONI_NOMAD_LOCK_DELAY'] = '10'
-        self._client = urllib3.PoolManager()
+        import requests
+        self._client = requests.Session()
 
     def _start(self):
         return psutil.Popen(['nomad', 'agent', '-dev', '-bind=127.0.0.1',
                              '-data-dir=' + self._work_directory], stdout=self._log, stderr=subprocess.STDOUT)
 
     def _request(self, method, path, body=None):
-        headers = {'Content-Type': 'application/json'} if body is not None else None
-        response = self._client.request(method, 'http://127.0.0.1:4646' + path,
-                                        body=body is not None and json.dumps(body) or None,
-                                        headers=headers, retries=False)
-        if response.status >= 300:
-            raise AssertionError('Nomad request failed with status {0}'.format(response.status))
-        return response.data and json.loads(response.data.decode('utf-8'))
+        response = self._client.request(method, 'http://127.0.0.1:4646' + path, json=body, allow_redirects=False)
+        if response.status_code < 200 or response.status_code >= 300:
+            raise AssertionError('Nomad request failed with status {0}'.format(response.status_code))
+        return response.content and response.json()
 
     def _is_running(self):
         try:

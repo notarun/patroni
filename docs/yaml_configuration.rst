@@ -136,8 +136,10 @@ Nomad
 Patroni uses the Nomad Variables API and variable locks. Nomad 1.7 or newer is required. Specify one of **host** or
 **url**.
 
--  **host**: the host:port for the Nomad agent. The default API port is ``4646``.
--  **url**: Nomad agent URL in the format ``http(s)://host:port``.
+-  **host**: the host:port for the Nomad agent, or an absolute Unix socket path such as
+   ``/secrets/api.sock``. The default API port is ``4646``.
+-  **url**: Nomad agent URL in the format ``http(s)://host:port``. Unix sockets may use
+   ``unix:///secrets/api.sock``.
 -  **port**: (optional) Nomad API port.
 -  **scheme**: (optional) **http** or **https**, defaults to **http**.
 -  **token**: (optional) Nomad ACL token, sent in the ``X-Nomad-Token`` header.

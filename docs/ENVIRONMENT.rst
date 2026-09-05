@@ -70,8 +70,8 @@ Consul
 Nomad
 -----
 
--  **PATRONI\_NOMAD\_HOST**: the host:port for the Nomad agent.
--  **PATRONI\_NOMAD\_URL**: Nomad agent URL in the format http(s)://host:port.
+-  **PATRONI\_NOMAD\_HOST**: the host:port for the Nomad agent, or an absolute Unix socket path such as ``/secrets/api.sock``.
+-  **PATRONI\_NOMAD\_URL**: Nomad agent URL in the format http(s)://host:port, or ``unix:///secrets/api.sock``.
 -  **PATRONI\_NOMAD\_PORT**: (optional) Nomad API port, defaults to ``4646``.
 -  **PATRONI\_NOMAD\_SCHEME**: (optional) **http** or **https**, defaults to **http**.
 -  **PATRONI\_NOMAD\_TOKEN**: (optional) Nomad management ACL token.

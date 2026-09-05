@@ -51,7 +51,7 @@ etcd or etcd3
 consul
     `py-consul` module in order to use Consul as DCS
 nomad
-    no additional Python module; Patroni uses its existing HTTP client to access Nomad
+    `requests` and `requests-unixsocket` modules in order to use Nomad as DCS
 zookeeper
     `kazoo` module in order to use Zookeeper as DCS
 exhibitor

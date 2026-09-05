@@ -2,17 +2,14 @@ import json
 import logging
 import os
 import re
-import socket
-import ssl
 import time
 
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import quote, urlparse
 
-import urllib3
-
-from urllib3.exceptions import HTTPError
+import requests
+import requests_unixsocket
 
 from ..exceptions import DCSError
 from ..postgresql.mpp import AbstractMPP
@@ -39,20 +36,21 @@ class NomadClient(object):
     def __init__(self, host: str = '127.0.0.1', port: int = 4646, token: Optional[str] = None,
                  scheme: str = 'http', verify: bool = True, cert: Optional[str] = None,
                  key: Optional[str] = None, cacert: Optional[str] = None, namespace: Optional[str] = None,
-                 region: Optional[str] = None) -> None:
-        self.base_uri = uri(scheme, (host, port))
-        self.token = token
+                 region: Optional[str] = None, unix_socket: Optional[str] = None) -> None:
+        self.base_uri = 'http+unix://' + quote(unix_socket, safe='') if unix_socket else uri(scheme, (host, port))
         self.namespace = namespace
         self.region = region
         self._read_timeout = 10.0
-        kwargs: Dict[str, Any] = {'cert_reqs': ssl.CERT_REQUIRED if verify or cacert else ssl.CERT_NONE}
-        if cert:
-            kwargs['cert_file'] = cert
-        if key:
-            kwargs['key_file'] = key
-        if cacert:
-            kwargs['ca_certs'] = cacert
-        self.http = urllib3.PoolManager(num_pools=10, maxsize=10, **kwargs)
+        self.session = requests_unixsocket.Session() if unix_socket else requests.Session()
+        self.session.trust_env = False
+        self.session.headers['User-Agent'] = USER_AGENT
+        if token:
+            self.session.headers['X-Nomad-Token'] = token
+        self.session.verify = cacert or verify
+        self.session.cert = (cert, key) if cert and key else cert
+
+    def close(self) -> None:
+        self.session.close()
 
     def set_read_timeout(self, timeout: float) -> None:
         self._read_timeout = timeout / 3.0
@@ -65,35 +63,27 @@ class NomadClient(object):
             query['namespace'] = self.namespace
         if self.region:
             query['region'] = self.region
-        url = self.base_uri + endpoint + (query and '?' + urlencode(query) or '')
-        headers = urllib3.make_headers(user_agent=USER_AGENT)
-        if self.token:
-            headers['X-Nomad-Token'] = self.token
-        if body is not None:
-            headers['Content-Type'] = 'application/json'
         timeout = self._read_timeout
         if deadline is not None:
             timeout = min(timeout, deadline - time.monotonic())
             if timeout <= 0:
                 raise NomadError('Nomad request deadline exceeded')
         try:
-            response = self.http.request(method, url, body=body is not None and json.dumps(body) or None,
-                                         headers=headers, timeout=urllib3.Timeout(total=timeout), retries=0)
-        except (HTTPError, socket.error, socket.timeout) as e:
+            response = self.session.request(method, self.base_uri + endpoint, params=query, json=body, timeout=timeout,
+                                            allow_redirects=False)
+        except requests.RequestException as e:
             raise NomadError(str(e))
-        content = response.data or b''
-        message = content.decode('utf-8', errors='replace')
-        if response.status == 404:
-            raise NomadNotFound(message)
-        if response.status == 409:
-            raise NomadConflict(message)
-        if response.status < 200 or response.status >= 300:
-            raise NomadError('{0}: {1}'.format(response.status, message))
-        if not content:
+        if response.status_code == 404:
+            raise NomadNotFound(response.text)
+        if response.status_code == 409:
+            raise NomadConflict(response.text)
+        if response.status_code < 200 or response.status_code >= 300:
+            raise NomadError('{0}: {1}'.format(response.status_code, response.text))
+        if not response.content:
             return True, response.headers
         try:
-            return json.loads(message), response.headers
-        except (TypeError, ValueError) as e:
+            return response.json(), response.headers
+        except ValueError as e:
             raise NomadError('Invalid response from Nomad: {0}'.format(e))
 
     @staticmethod
@@ -114,13 +104,9 @@ class NomadClient(object):
                 return ret
             params['next_token'] = next_token
 
-    def put_variable(self, path: str, value: str, cas: Optional[int] = None,
-                     lock_id: Optional[str] = None) -> Dict[str, Any]:
+    def put_variable(self, path: str, value: str, cas: Optional[int] = None) -> Dict[str, Any]:
         params = {'cas': cas} if cas is not None else None
-        body: Dict[str, Any] = {'Items': {'value': value}}
-        if lock_id:
-            body['Lock'] = {'ID': lock_id}
-        return self._request('PUT', '/v1/var/' + self._path(path), params, body)[0]
+        return self._request('PUT', '/v1/var/' + self._path(path), params, {'Items': {'value': value}})[0]
 
     def delete_variable(self, path: str, cas: Optional[int] = None) -> bool:
         params = {'cas': cas} if cas is not None else None
@@ -187,15 +173,27 @@ class Nomad(AbstractDCS):
             raise ValueError('Nomad scheme must be http or https')
         if config.get('url'):
             parsed = urlparse(config['url'])
-            if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password \
-                    or parsed.path not in ('', '/') or parsed.params or parsed.query or parsed.fragment:
+            if parsed.scheme == 'unix' and parsed.path.startswith('/') and not any(
+                    (parsed.netloc, parsed.params, parsed.query, parsed.fragment)):
+                host = parsed.path
+            elif parsed.scheme not in ('http', 'https') or not parsed.hostname \
+                    or parsed.username or parsed.password or parsed.path not in ('', '/') \
+                    or parsed.params or parsed.query or parsed.fragment:
                 raise ValueError('Invalid Nomad URL')
-            scheme, host, port = parsed.scheme, parsed.hostname, parsed.port or 4646
+            else:
+                scheme, host, port = parsed.scheme, parsed.hostname, parsed.port or 4646
         elif config.get('host'):
-            host, parsed_port = split_host_port(config['host'], 4646)
-            port = int(config.get('port', parsed_port))
+            if config['host'].startswith('/'):
+                host = config['host']
+            else:
+                host, parsed_port = split_host_port(config['host'], 4646)
+                port = int(config.get('port', parsed_port))
         elif config.get('port'):
             port = int(config['port'])
+
+        tcp_options = ('port', 'scheme', 'verify', 'cacert', 'cert', 'key')
+        if host.startswith('/') and any(name in config for name in tcp_options):
+            raise ValueError('Nomad TCP and TLS settings can not be used with a Unix socket')
 
         verify = config.get('verify', True)
         if not isinstance(verify, bool):
@@ -203,7 +201,7 @@ class Nomad(AbstractDCS):
         return NomadClient(host=host, port=port, scheme=scheme, token=config.get('token'),
                            verify=verify is not False, cert=config.get('cert'), key=config.get('key'),
                            cacert=config.get('cacert'), namespace=config.get('nomad_namespace'),
-                           region=config.get('region'))
+                           region=config.get('region'), unix_socket=host if host.startswith('/') else None)
 
     def reload_config(self, config: Any) -> None:
         super(Nomad, self).reload_config(config)
@@ -216,7 +214,7 @@ class Nomad(AbstractDCS):
             old_client = self._client
             self._client = self._create_client(nomad_config)
             self._client.set_read_timeout(config['retry_timeout'])
-            old_client.http.clear()
+            old_client.close()
 
     def set_ttl(self, ttl: int) -> Optional[bool]:
         if ttl < 10 or ttl > 86400:

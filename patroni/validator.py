@@ -166,6 +166,11 @@ def validate_host_port(host_port: str, listen: bool = False, multiple_hosts: boo
     return True
 
 
+def validate_nomad_host(value: str) -> bool:
+    """Validate a Nomad TCP address or an absolute Unix socket path."""
+    return True if os.path.isabs(value) else validate_host_port(value)
+
+
 def validate_host_port_list(value: List[str]) -> bool:
     """Validate a list of host(s) and port items.
 
@@ -1200,7 +1205,7 @@ schema = Schema({
         },
         "nomad": {
             Or("host", "url"): Case({
-                "host": validate_host_port,
+                "host": validate_nomad_host,
                 "url": str
             }),
             Optional("port"): IntValidator(max=65535, expected_type=int, raise_assert=True),

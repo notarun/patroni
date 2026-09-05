@@ -1,13 +1,34 @@
 import json
+import os
+import socket
+import socketserver
+import tempfile
+import threading
 import unittest
 
+from http.server import BaseHTTPRequestHandler
 from unittest.mock import Mock
 
-import urllib3
+import requests
+import requests_unixsocket
 
 from patroni.dcs import Cluster, Leader, Member
 from patroni.dcs.nomad import Nomad, NomadClient, NomadConflict, NomadError, NomadNotFound
 from patroni.postgresql.mpp import get_mpp
+
+
+class UnixSocketHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        body = json.dumps({'Path': self.path[len('/v1/var/'):]}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
 
 
 def variable(path, value='', index=1, lock_id=None):
@@ -21,63 +42,86 @@ class TestNomadClient(unittest.TestCase):
 
     def setUp(self):
         self.client = NomadClient(token='secret', namespace='testing', region='global')
-        self.client.http.request = Mock()
+        self.client.session.request = Mock()
 
     @staticmethod
     def response(status=200, data=b'{}', headers=None):
-        return urllib3.response.HTTPResponse(status=status, body=data, headers=headers or {}, preload_content=True)
+        response = requests.Response()
+        response.status_code = status
+        response._content = data
+        response.headers.update(headers or {})
+        return response
 
     def test_request(self):
-        self.client.http.request.return_value = self.response(
+        self.client.session.request.return_value = self.response(
             data=b'{"ModifyIndex":2}', headers={'X-Nomad-Index': '3'})
         ret = self.client.put_variable('service/a b/config', '{}', cas=1)
 
         self.assertEqual(ret['ModifyIndex'], 2)
-        args, kwargs = self.client.http.request.call_args
+        args, kwargs = self.client.session.request.call_args
         self.assertEqual(args[0], 'PUT')
-        self.assertIn('/v1/var/service/a%20b/config?', args[1])
-        self.assertIn('cas=1', args[1])
-        self.assertIn('namespace=testing', args[1])
-        self.assertIn('region=global', args[1])
-        self.assertEqual(kwargs['headers']['X-Nomad-Token'], 'secret')
-        self.assertEqual(json.loads(kwargs['body']), {'Items': {'value': '{}'}})
-        self.assertEqual(kwargs['timeout'].total, self.client._read_timeout)
+        self.assertIn('/v1/var/service/a%20b/config', args[1])
+        self.assertEqual(kwargs['params'], {'cas': 1, 'namespace': 'testing', 'region': 'global'})
+        self.assertEqual(self.client.session.headers['X-Nomad-Token'], 'secret')
+        self.assertEqual(kwargs['json'], {'Items': {'value': '{}'}})
+        self.assertEqual(kwargs['timeout'], self.client._read_timeout)
+        self.assertFalse(kwargs['allow_redirects'])
+        self.assertFalse(self.client.session.trust_env)
 
     def test_statuses(self):
-        self.client.http.request.return_value = self.response(404, b'not found')
+        self.client.session.request.return_value = self.response(404, b'not found')
         self.assertRaises(NomadNotFound, self.client.get_variable, 'missing')
-        self.client.http.request.return_value = self.response(409, b'conflict')
+        self.client.session.request.return_value = self.response(409, b'conflict')
         self.assertRaises(NomadConflict, self.client.put_variable, 'key', 'value', 1)
-        self.client.http.request.return_value = self.response(500, b'broken')
+        self.client.session.request.return_value = self.response(500, b'broken')
         self.assertRaises(NomadError, self.client.get_variable, 'key')
-        self.client.http.request.return_value = self.response(200, b'{')
+        self.client.session.request.return_value = self.response(302, b'redirect')
+        self.assertRaises(NomadError, self.client.get_variable, 'key')
+        self.client.session.request.return_value = self.response(200, b'{')
         self.assertRaises(NomadError, self.client.get_variable, 'key')
 
     def test_lock_requests(self):
-        self.client.http.request.return_value = self.response(data=b'{"Lock":{"ID":"123"}}')
+        self.client.session.request.return_value = self.response(data=b'{"Lock":{"ID":"123"}}')
         self.assertEqual(self.client.acquire_lock('leader', 'node1', 30, 10)['Lock']['ID'], '123')
-        request = self.client.http.request.call_args
-        self.assertIn('lock-acquire=', request.args[1])
-        self.assertEqual(json.loads(request.kwargs['body'])['Lock'], {'TTL': '30s', 'LockDelay': '10s'})
+        request = self.client.session.request.call_args
+        self.assertEqual(request.kwargs['params']['lock-acquire'], '')
+        self.assertEqual(request.kwargs['json']['Lock'], {'TTL': '30s', 'LockDelay': '10s'})
 
         self.client.renew_lock('leader', '123')
-        self.assertIn('lock-renew=', self.client.http.request.call_args.args[1])
+        self.assertIn('lock-renew', self.client.session.request.call_args.kwargs['params'])
         self.client.release_lock('leader', '123')
-        body = json.loads(self.client.http.request.call_args.kwargs['body'])
-        self.assertIn('lock-release=', self.client.http.request.call_args.args[1])
+        body = self.client.session.request.call_args.kwargs['json']
+        self.assertIn('lock-release', self.client.session.request.call_args.kwargs['params'])
         self.assertNotIn('Items', body)
 
         self.client.acquire_lock('leader', 'node1', 30, 10, '123')
-        self.assertEqual(json.loads(self.client.http.request.call_args.kwargs['body'])['Lock']['ID'], '123')
+        self.assertEqual(self.client.session.request.call_args.kwargs['json']['Lock']['ID'], '123')
 
     def test_list_pagination_and_delete(self):
-        self.client.http.request.side_effect = [
+        self.client.session.request.side_effect = [
             self.response(data=b'[{"Path":"service/a"}]', headers={'X-Nomad-NextToken': 'next'}),
             self.response(data=b'[{"Path":"service/b"}]'),
             self.response(status=204, data=b'')]
         self.assertEqual([v['Path'] for v in self.client.list_variables('service/')], ['service/a', 'service/b'])
-        self.assertIn('next_token=next', self.client.http.request.call_args_list[1].args[1])
+        self.assertEqual(self.client.session.request.call_args_list[1].kwargs['params']['next_token'], 'next')
         self.assertTrue(self.client.delete_variable('service/a', 1))
+
+    @unittest.skipUnless(hasattr(socket, 'AF_UNIX') and hasattr(socketserver, 'UnixStreamServer'),
+                         'Unix sockets are not supported')
+    def test_unix_socket(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'api.sock')
+            server = socketserver.UnixStreamServer(path, UnixSocketHandler)
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            try:
+                client = NomadClient(unix_socket=path)
+                self.assertIsInstance(client.session, requests_unixsocket.Session)
+                self.assertEqual(client.get_variable('service/test/config')['Path'], 'service/test/config')
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
 
 
 class TestNomad(unittest.TestCase):
@@ -224,8 +268,16 @@ class TestNomad(unittest.TestCase):
         self.c.reload_config({'loop_wait': 5, 'ttl': 30, 'retry_timeout': 6,
                               'nomad': {'url': 'https://nomad.example:4647', 'token': 'new', 'lock_delay': 11}})
         self.assertEqual(self.c._client.base_uri, 'https://nomad.example:4647')
-        self.assertEqual(self.c._client.token, 'new')
+        self.assertEqual(self.c._client.session.headers['X-Nomad-Token'], 'new')
         self.assertEqual(self.c._lock_delay, 11)
+
+    def test_unix_socket_config(self):
+        for config in ({'host': '/secrets/api.sock'}, {'url': 'unix:///secrets/api.sock'},
+                       {'url': 'unix:/secrets/api.sock'}):
+            client = self.c._create_client(config)
+            self.assertEqual(client.base_uri, 'http+unix://%2Fsecrets%2Fapi.sock')
+        self.assertRaises(ValueError, self.c._create_client,
+                          {'host': '/secrets/api.sock', 'verify': False})
 
 
 if __name__ == '__main__':
