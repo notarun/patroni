@@ -5,7 +5,7 @@ import re
 import time
 
 from collections import defaultdict
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, cast, Dict, List, Mapping, Optional, Tuple, TYPE_CHECKING, Union
 from urllib.parse import quote, urlparse
 
 import requests
@@ -15,6 +15,9 @@ from ..exceptions import DCSError
 from ..postgresql.mpp import AbstractMPP
 from ..utils import parse_bool, parse_int, Retry, RetryFailedError, split_host_port, uri, USER_AGENT
 from . import AbstractDCS, Cluster, ClusterConfig, Failover, Leader, Member, Status, SyncState, TimelineHistory
+
+if TYPE_CHECKING:  # pragma: no cover
+    from ..config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -168,11 +171,15 @@ class Nomad(AbstractDCS):
 
     @staticmethod
     def _create_client(config: Mapping[str, Any]) -> NomadClient:
-        host, port, scheme = '127.0.0.1', 4646, config.get('scheme', 'http')
+        host, port = '127.0.0.1', 4646
+        scheme_value = config.get('scheme')
+        scheme = scheme_value if isinstance(scheme_value, str) else 'http'
         if scheme not in ('http', 'https'):
             raise ValueError('Nomad scheme must be http or https')
-        if config.get('url'):
-            parsed = urlparse(config['url'])
+        url = config.get('url')
+        host_value = config.get('host')
+        if isinstance(url, str) and url:
+            parsed = urlparse(url)
             if parsed.scheme == 'unix' and parsed.path.startswith('/') and not any(
                     (parsed.netloc, parsed.params, parsed.query, parsed.fragment)):
                 host = parsed.path
@@ -182,11 +189,11 @@ class Nomad(AbstractDCS):
                 raise ValueError('Invalid Nomad URL')
             else:
                 scheme, host, port = parsed.scheme, parsed.hostname, parsed.port or 4646
-        elif config.get('host'):
-            if config['host'].startswith('/'):
-                host = config['host']
+        elif isinstance(host_value, str) and host_value:
+            if host_value.startswith('/'):
+                host = host_value
             else:
-                host, parsed_port = split_host_port(config['host'], 4646)
+                host, parsed_port = split_host_port(host_value, 4646)
                 port = int(config.get('port', parsed_port))
         elif config.get('port'):
             port = int(config['port'])
@@ -203,7 +210,7 @@ class Nomad(AbstractDCS):
                            cacert=config.get('cacert'), namespace=config.get('nomad_namespace'),
                            region=config.get('region'), unix_socket=host if host.startswith('/') else None)
 
-    def reload_config(self, config: Any) -> None:
+    def reload_config(self, config: Union['Config', Dict[str, Any]]) -> None:
         super(Nomad, self).reload_config(config)
         nomad_config = config.get('nomad')
         if nomad_config:
@@ -234,28 +241,40 @@ class Nomad(AbstractDCS):
         self._client.set_read_timeout(retry_timeout)
 
     @staticmethod
-    def _value(node: Optional[Dict[str, Any]]) -> Optional[str]:
-        return node and node.get('Items', {}).get('value')
+    def _nested(node: Optional[Dict[str, Any]], key: str) -> Mapping[str, Any]:
+        value = node and node.get(key)
+        return cast(Mapping[str, Any], value) if isinstance(value, dict) else {}
+
+    @classmethod
+    def _value(cls, node: Optional[Dict[str, Any]]) -> Optional[str]:
+        value = cls._nested(node, 'Items').get('value')
+        return value if isinstance(value, str) else None
+
+    @classmethod
+    def _lock_id(cls, node: Optional[Dict[str, Any]]) -> Optional[str]:
+        value = cls._nested(node, 'Lock').get('ID')
+        return value if isinstance(value, str) else None
 
     @staticmethod
-    def _lock_id(node: Optional[Dict[str, Any]]) -> Optional[str]:
-        return node and node.get('Lock', {}).get('ID')
+    def _index(node: Dict[str, Any]) -> int:
+        value = node.get('ModifyIndex')
+        return value if isinstance(value, int) else 0
 
-    @staticmethod
-    def _lock_setting(node: Optional[Dict[str, Any]], name: str) -> Optional[int]:
-        return node and parse_int(node.get('Lock', {}).get(name), 's')
+    @classmethod
+    def _lock_setting(cls, node: Optional[Dict[str, Any]], name: str) -> Optional[int]:
+        return parse_int(cls._nested(node, 'Lock').get(name), 's')
 
     @classmethod
     def member(cls, node: Dict[str, Any]) -> Member:
-        return Member.from_node(node['ModifyIndex'], os.path.basename(node['Path']),
-                                cls._lock_id(node), cls._value(node))
+        return Member.from_node(cls._index(node), os.path.basename(node['Path']),
+                                cls._lock_id(node), cls._value(node) or '')
 
     def _cluster_from_nodes(self, nodes: Dict[str, Dict[str, Any]]) -> Cluster:
         initialize = self._value(nodes.get(self._INITIALIZE))
         config_node = nodes.get(self._CONFIG)
-        config = config_node and ClusterConfig.from_node(config_node['ModifyIndex'], self._value(config_node))
+        config = config_node and ClusterConfig.from_node(self._index(config_node), self._value(config_node) or '')
         history_node = nodes.get(self._HISTORY)
-        history = history_node and TimelineHistory.from_node(history_node['ModifyIndex'], self._value(history_node))
+        history = history_node and TimelineHistory.from_node(self._index(history_node), self._value(history_node) or '')
         status = Status.from_node(self._value(nodes.get(self._STATUS) or nodes.get(self._LEADER_OPTIME)))
         members = [self.member(node) for key, node in nodes.items()
                    if key.startswith(self._MEMBERS) and key.count('/') == 1 and self._lock_id(node)]
@@ -268,15 +287,15 @@ class Nomad(AbstractDCS):
                 self._leader_lock_ttl = self._lock_setting(leader_node, 'TTL')
             member = next((item for item in members if item.name == leader_name),
                           Member(-1, leader_name, None, {}))
-            leader = Leader(leader_node['ModifyIndex'], self._lock_id(leader_node), member)
+            leader = Leader(self._index(leader_node), self._lock_id(leader_node), member)
 
         failover_node = nodes.get(self._FAILOVER)
-        failover = failover_node and Failover.from_node(failover_node['ModifyIndex'], self._value(failover_node))
+        failover = failover_node and Failover.from_node(self._index(failover_node), self._value(failover_node) or '')
         sync_node = nodes.get(self._SYNC)
-        sync = SyncState.from_node(sync_node and sync_node['ModifyIndex'], self._value(sync_node))
+        sync = SyncState.from_node(self._index(sync_node) if sync_node else None, self._value(sync_node))
         failsafe_node = nodes.get(self._FAILSAFE)
         try:
-            failsafe = json.loads(self._value(failsafe_node)) if failsafe_node else None
+            failsafe = json.loads(self._value(failsafe_node) or '') if failsafe_node else None
         except (TypeError, ValueError):
             failsafe = None
 
@@ -323,7 +342,7 @@ class Nomad(AbstractDCS):
         value = json.dumps(data, separators=(',', ':'))
         if not self._member_lock:
             member = self.cluster and self.cluster.get_member(self._name, fallback_to_leader=False)
-            if member and member.session:
+            if member and isinstance(member.session, str):
                 self._member_lock = member.session
                 self._member_value = json.dumps(member.data, separators=(',', ':'))
         if not self._member_lock:
@@ -362,7 +381,7 @@ class Nomad(AbstractDCS):
         return self.attempt_to_acquire_leader()
 
     def _update_leader(self, leader: Leader) -> bool:
-        if not self._leader_lock and leader.name == self._name:
+        if not self._leader_lock and leader.name == self._name and isinstance(leader.session, str):
             self._leader_lock = leader.session
         if not self._leader_lock or leader.session != self._leader_lock or leader.name != self._name:
             return False
