@@ -3,8 +3,8 @@
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
-Patroni: A Template for PostgreSQL HA
-=====================================
+Patroni: A Template for PostgreSQL HA with ZooKeeper, etcd, Nomad or Consul
+===========================================================================
 
 .. image:: _static/patroni-logo.png
    :height: 128px

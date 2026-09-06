@@ -4,8 +4,8 @@
    :height: 128px
    :width: 128px
 
-Patroni: A Template for PostgreSQL HA
-=====================================
+Patroni: A Template for PostgreSQL HA with ZooKeeper, etcd, Nomad or Consul
+===========================================================================
 
 You can find a searchable version of this documentation at
 `patroni.readthedocs.io <https://patroni.readthedocs.io>`__.
