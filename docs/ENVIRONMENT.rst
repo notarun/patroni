@@ -79,7 +79,7 @@ Nomad
 -  **PATRONI\_NOMAD\_CACERT**: (optional) CA certificate used for TLS validation.
 -  **PATRONI\_NOMAD\_CERT**: (optional) client certificate file.
 -  **PATRONI\_NOMAD\_KEY**: (optional) client key file.
--  **PATRONI\_NOMAD\_NOMAD\_NAMESPACE**: (optional) Nomad ACL namespace.
+-  **PATRONI\_NOMAD\_NAMESPACE**: (optional) Nomad ACL namespace.
 
 See :ref:`nomad_settings` for the management-token requirement imposed by Nomad lock-field redaction.
 
