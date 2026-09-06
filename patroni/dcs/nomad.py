@@ -138,15 +138,7 @@ class NomadClient(object):
         return self._request('GET', '/v1/var/' + self._path(path), deadline=deadline)[0]
 
     def list_variables(self, prefix: str, deadline: Optional[float] = None) -> List[Dict[str, Any]]:
-        ret: List[Dict[str, Any]] = []
-        params: Dict[str, Any] = {'prefix': prefix}
-        while True:
-            values, headers = self._request('GET', '/v1/vars', params, deadline=deadline)
-            ret.extend(values)
-            next_token = headers.get('X-Nomad-NextToken')
-            if not next_token:
-                return ret
-            params['next_token'] = next_token
+        return self._request('GET', '/v1/vars', {'prefix': prefix}, deadline=deadline)[0]
 
     def put_variable(self, path: str, value: str, cas: Optional[int] = None) -> Dict[str, Any]:
         params = {'cas': cas} if cas is not None else None
@@ -202,20 +194,16 @@ class Nomad(AbstractDCS):
                or path.startswith('nomad/') for path in paths):
             raise ValueError('Patroni namespace, scope, and name must form valid non-reserved Nomad variable paths')
 
-        self._client = self._create_client(config)
+        self._client = NomadClient.from_config(config)
         self.set_retry_timeout(config['retry_timeout'])
         self.set_ttl(config.get('ttl') or 30)
-
-    @staticmethod
-    def _create_client(config: Mapping[str, Any]) -> NomadClient:
-        return NomadClient.from_config(config)
 
     def reload_config(self, config: Union['Config', Dict[str, Any]]) -> None:
         super(Nomad, self).reload_config(config)
         nomad_config = config.get('nomad')
         if nomad_config:
             old_client = self._client
-            self._client = self._create_client(nomad_config)
+            self._client = NomadClient.from_config(nomad_config)
             self._client.set_read_timeout(config['retry_timeout'])
             old_client.close()
 
@@ -393,28 +381,25 @@ class Nomad(AbstractDCS):
         except RetryFailedError as e:
             raise NomadError(e)
 
-    def _set_value(self, path: str, value: str, version: Optional[int] = None) -> Dict[str, Any]:
-        return self._client.put_variable(path, value, version)
-
     @catch_nomad_errors
     def set_failover_value(self, value: str, version: Optional[int] = None) -> bool:
-        return bool(self._set_value(self.failover_path, value, version))
+        return bool(self._client.put_variable(self.failover_path, value, version))
 
     @catch_nomad_errors
     def set_config_value(self, value: str, version: Optional[int] = None) -> bool:
-        return bool(self._set_value(self.config_path, value, version))
+        return bool(self._client.put_variable(self.config_path, value, version))
 
     @catch_nomad_errors
     def _write_leader_optime(self, last_lsn: str) -> bool:
-        return bool(self._set_value(self.leader_optime_path, last_lsn))
+        return bool(self._client.put_variable(self.leader_optime_path, last_lsn))
 
     @catch_nomad_errors
     def _write_status(self, value: str) -> bool:
-        return bool(self._set_value(self.status_path, value))
+        return bool(self._client.put_variable(self.status_path, value))
 
     @catch_nomad_errors
     def _write_failsafe(self, value: str) -> bool:
-        return bool(self._set_value(self.failsafe_path, value))
+        return bool(self._client.put_variable(self.failsafe_path, value))
 
     @catch_nomad_errors
     def initialize(self, create_new: bool = True, sysid: str = '') -> bool:
@@ -445,7 +430,7 @@ class Nomad(AbstractDCS):
 
     @catch_nomad_errors
     def set_history_value(self, value: str) -> bool:
-        return bool(self._set_value(self.history_path, value))
+        return bool(self._client.put_variable(self.history_path, value))
 
     @catch_nomad_errors
     def _delete_leader(self, leader: Leader) -> bool:
@@ -458,7 +443,7 @@ class Nomad(AbstractDCS):
 
     @catch_nomad_errors
     def set_sync_state_value(self, value: str, version: Optional[int] = None) -> Union[int, bool]:
-        result = self._set_value(self.sync_path, value, version)
+        result = self._client.put_variable(self.sync_path, value, version)
         return result['ModifyIndex']
 
     @catch_nomad_errors
