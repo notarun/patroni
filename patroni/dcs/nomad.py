@@ -46,12 +46,53 @@ class NomadClient(object):
         self.namespace = namespace
         self._read_timeout = 10.0
         self.session = requests_unixsocket.Session() if unix_socket else requests.Session()
+        # DCS traffic must not be redirected through ambient proxy settings.
         self.session.trust_env = False
         self.session.headers['User-Agent'] = USER_AGENT
         if token:
             self.session.headers['X-Nomad-Token'] = token
         self.session.verify = cacert or verify
         self.session.cert = (cert, key) if cert and key else cert
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any]) -> 'NomadClient':
+        host, port = '127.0.0.1', 4646
+        scheme_value = config.get('scheme')
+        scheme = scheme_value if isinstance(scheme_value, str) else 'http'
+        if scheme not in ('http', 'https'):
+            raise ValueError('Nomad scheme must be http or https')
+        url = config.get('url')
+        host_value = config.get('host')
+        if isinstance(url, str) and url:
+            parsed = urlparse(url)
+            if parsed.scheme == 'unix' and parsed.path.startswith('/') and not any(
+                    (parsed.netloc, parsed.params, parsed.query, parsed.fragment)):
+                host = parsed.path
+            elif parsed.scheme not in ('http', 'https') or not parsed.hostname \
+                    or parsed.username or parsed.password or parsed.path not in ('', '/') \
+                    or parsed.params or parsed.query or parsed.fragment:
+                raise ValueError('Invalid Nomad URL')
+            else:
+                scheme, host, port = parsed.scheme, parsed.hostname, parsed.port or 4646
+        elif isinstance(host_value, str) and host_value:
+            if host_value.startswith('/'):
+                host = host_value
+            else:
+                host, parsed_port = split_host_port(host_value, 4646)
+                port = int(config.get('port', parsed_port))
+        elif config.get('port'):
+            port = int(config['port'])
+
+        tcp_options = ('port', 'scheme', 'verify', 'cacert', 'cert', 'key')
+        if host.startswith('/') and any(name in config for name in tcp_options):
+            raise ValueError('Nomad TCP and TLS settings can not be used with a Unix socket')
+
+        verify = config.get('verify', True)
+        if not isinstance(verify, bool):
+            verify = parse_bool(verify)
+        return cls(host=host, port=port, scheme=scheme, token=config.get('token'), verify=verify is not False,
+                   cert=config.get('cert'), key=config.get('key'), cacert=config.get('cacert'),
+                   namespace=config.get('nomad_namespace'), unix_socket=host if host.startswith('/') else None)
 
     def close(self) -> None:
         self.session.close()
@@ -71,6 +112,7 @@ class NomadClient(object):
             if timeout <= 0:
                 raise NomadError('Nomad request deadline exceeded')
         try:
+            # Redirects could disclose the Nomad token to an untrusted endpoint.
             response = self.session.request(method, self.base_uri + endpoint, params=query, json=body, timeout=timeout,
                                             allow_redirects=False)
         except requests.RequestException as e:
@@ -143,6 +185,7 @@ class Nomad(AbstractDCS):
 
     def __init__(self, config: Dict[str, Any], mpp: AbstractMPP) -> None:
         super(Nomad, self).__init__(config, mpp)
+        # Nomad variable paths are relative and reject a leading slash.
         self._base_path = self._base_path[1:]
         self._retry = Retry(deadline=config['retry_timeout'], max_delay=1, max_tries=-1,
                             retry_exceptions=NomadError)
@@ -165,44 +208,7 @@ class Nomad(AbstractDCS):
 
     @staticmethod
     def _create_client(config: Mapping[str, Any]) -> NomadClient:
-        host, port = '127.0.0.1', 4646
-        scheme_value = config.get('scheme')
-        scheme = scheme_value if isinstance(scheme_value, str) else 'http'
-        if scheme not in ('http', 'https'):
-            raise ValueError('Nomad scheme must be http or https')
-        url = config.get('url')
-        host_value = config.get('host')
-        if isinstance(url, str) and url:
-            parsed = urlparse(url)
-            if parsed.scheme == 'unix' and parsed.path.startswith('/') and not any(
-                    (parsed.netloc, parsed.params, parsed.query, parsed.fragment)):
-                host = parsed.path
-            elif parsed.scheme not in ('http', 'https') or not parsed.hostname \
-                    or parsed.username or parsed.password or parsed.path not in ('', '/') \
-                    or parsed.params or parsed.query or parsed.fragment:
-                raise ValueError('Invalid Nomad URL')
-            else:
-                scheme, host, port = parsed.scheme, parsed.hostname, parsed.port or 4646
-        elif isinstance(host_value, str) and host_value:
-            if host_value.startswith('/'):
-                host = host_value
-            else:
-                host, parsed_port = split_host_port(host_value, 4646)
-                port = int(config.get('port', parsed_port))
-        elif config.get('port'):
-            port = int(config['port'])
-
-        tcp_options = ('port', 'scheme', 'verify', 'cacert', 'cert', 'key')
-        if host.startswith('/') and any(name in config for name in tcp_options):
-            raise ValueError('Nomad TCP and TLS settings can not be used with a Unix socket')
-
-        verify = config.get('verify', True)
-        if not isinstance(verify, bool):
-            verify = parse_bool(verify)
-        return NomadClient(host=host, port=port, scheme=scheme, token=config.get('token'),
-                           verify=verify is not False, cert=config.get('cert'), key=config.get('key'),
-                           cacert=config.get('cacert'), namespace=config.get('nomad_namespace'),
-                           unix_socket=host if host.startswith('/') else None)
+        return NomadClient.from_config(config)
 
     def reload_config(self, config: Union['Config', Dict[str, Any]]) -> None:
         super(Nomad, self).reload_config(config)
@@ -301,6 +307,7 @@ class Nomad(AbstractDCS):
             try:
                 node = self._client.get_variable(variable_path, deadline)
             except NomadNotFound:
+                # Variables may disappear between the list and get requests.
                 continue
             nodes[variable_path[len(path):]] = node
         return nodes
@@ -330,6 +337,7 @@ class Nomad(AbstractDCS):
     def touch_member(self, data: Dict[str, Any]) -> bool:
         value = json.dumps(data, separators=(',', ':'))
         if not self._member_lock:
+            # Preserve lock ownership across Patroni restarts within the lock TTL.
             member = self.cluster and self.cluster.get_member(self._name, fallback_to_leader=False)
             if member and isinstance(member.session, str):
                 self._member_lock = member.session
@@ -343,6 +351,7 @@ class Nomad(AbstractDCS):
         try:
             self._client.renew_lock(self.member_path, self._member_lock)
             if value != self._member_value:
+                # Renewing a Nomad lock does not update its variable items.
                 self._client.acquire_lock(self.member_path, value, self._member_lock_ttl or self._ttl,
                                           self._member_lock)
                 self._member_value = value
@@ -370,6 +379,7 @@ class Nomad(AbstractDCS):
 
     def _update_leader(self, leader: Leader) -> bool:
         if not self._leader_lock and leader.name == self._name and isinstance(leader.session, str):
+            # Recover a still-valid leader lock after Patroni restarts.
             self._leader_lock = leader.session
         if not self._leader_lock or leader.session != self._leader_lock or leader.name != self._name:
             return False

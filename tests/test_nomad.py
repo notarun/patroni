@@ -182,10 +182,6 @@ class NomadForTests(Nomad):
     def write_leader_optime_value(self, value: str) -> bool:
         return self._write_leader_optime(value)
 
-    @staticmethod
-    def create_client(config: Mapping[str, Any]) -> NomadClient:
-        return Nomad._create_client(config)
-
 
 class TestNomad(unittest.TestCase):
 
@@ -342,9 +338,9 @@ class TestNomad(unittest.TestCase):
     def test_unix_socket_config(self):
         for config in ({'host': '/secrets/api.sock'}, {'url': 'unix:///secrets/api.sock'},
                        {'url': 'unix:/secrets/api.sock'}):
-            client = self.c.create_client(config)
+            client = NomadClient.from_config(config)
             self.assertEqual(client.base_uri, 'http+unix://%2Fsecrets%2Fapi.sock')
-        self.assertRaises(ValueError, self.c.create_client,
+        self.assertRaises(ValueError, NomadClient.from_config,
                           {'host': '/secrets/api.sock', 'verify': False})
 
 
