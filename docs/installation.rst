@@ -50,6 +50,8 @@ etcd or etcd3
     `python-etcd` module in order to use Etcd as Distributed Configuration Store (DCS)
 consul
     `py-consul` module in order to use Consul as DCS
+nomad
+    `requests` and `requests-unixsocket` modules in order to use Nomad as DCS
 zookeeper
     `kazoo` module in order to use Zookeeper as DCS
 exhibitor

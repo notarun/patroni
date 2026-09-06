@@ -9,7 +9,7 @@ from unittest.mock import Mock, mock_open, patch
 
 from patroni.dcs import dcs_modules
 from patroni.postgresql.sync import SYNC_STRICT_PLACEHOLDER
-from patroni.validator import Directory, populate_validate_params, schema, Schema
+from patroni.validator import Directory, populate_validate_params, schema, Schema, validate_nomad_host
 
 available_dcs = [m.split(".")[-1] for m in dcs_modules()]
 config = {
@@ -46,6 +46,9 @@ config = {
     },
     "consul": {
         "host": "127.0.0.1:5000"
+    },
+    "nomad": {
+        "host": "127.0.0.1:4646"
     },
     "etcd": {
         "hosts": "127.0.0.1:2379,127.0.0.1:2380"
@@ -206,6 +209,12 @@ class TestValidator(unittest.TestCase):
         errors = schema(config)
         output = "\n".join(errors)
         self.assertEqual(['postgresql.bin_dir', 'raft.bind_addr', 'raft.self_addr'], parse_output(output))
+
+    def test_nomad_unix_socket(self, mock_out, mock_err):
+        self.assertTrue(validate_nomad_host('/secrets/api.sock'))
+        c = copy.deepcopy(config)
+        c['nomad']['host'] = '/secrets/api.sock'
+        self.assertNotIn('nomad.host', parse_output('\n'.join(schema(c))))
 
     def test_bin_dir_is_file(self, mock_out, mock_err):
         files.append(config["postgresql"]["data_dir"])

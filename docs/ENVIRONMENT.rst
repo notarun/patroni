@@ -67,6 +67,22 @@ Consul
 -  **PATRONI\_CONSUL\_SERVICE\_CHECK\_INTERVAL**: (optional) how often to perform health check against registered url
 -  **PATRONI\_CONSUL\_SERVICE\_CHECK\_TLS\_SERVER\_NAME**: (optional) override SNI host when connecting via TLS, see also `consul agent check API reference <https://www.consul.io/api-docs/agent/check#tlsservername>`__.
 
+Nomad
+-----
+
+-  **PATRONI\_NOMAD\_HOST**: the host:port for the Nomad agent, or an absolute Unix socket path such as ``/secrets/api.sock``.
+-  **PATRONI\_NOMAD\_URL**: Nomad agent URL in the format http(s)://host:port, or ``unix:///secrets/api.sock``.
+-  **PATRONI\_NOMAD\_PORT**: (optional) Nomad API port, defaults to ``4646``.
+-  **PATRONI\_NOMAD\_SCHEME**: (optional) **http** or **https**, defaults to **http**.
+-  **PATRONI\_NOMAD\_TOKEN**: (optional) Nomad management ACL token.
+-  **PATRONI\_NOMAD\_VERIFY**: (optional) whether to verify the TLS certificate.
+-  **PATRONI\_NOMAD\_CACERT**: (optional) CA certificate used for TLS validation.
+-  **PATRONI\_NOMAD\_CERT**: (optional) client certificate file.
+-  **PATRONI\_NOMAD\_KEY**: (optional) client key file.
+-  **PATRONI\_NOMAD\_NAMESPACE**: (optional) Nomad ACL namespace.
+
+See :ref:`nomad_settings` for the management-token requirement imposed by Nomad lock-field redaction.
+
 Etcd
 ----
 

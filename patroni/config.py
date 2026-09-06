@@ -686,7 +686,8 @@ class Config(object):
                               'SERVICE_TAGS', 'NAMESPACE', 'CONTEXT', 'USE_ENDPOINTS', 'SCOPE_LABEL', 'ROLE_LABEL',
                               'POD_IP', 'PORTS', 'LABELS', 'BYPASS_API_SERVICE', 'RETRIABLE_HTTP_CODES', 'KEY_PASSWORD',
                               'USE_SSL', 'SET_ACLS', 'GROUP', 'DATABASE', 'LEADER_LABEL_VALUE', 'FOLLOWER_LABEL_VALUE',
-                              'STANDBY_LEADER_LABEL_VALUE', 'TMP_ROLE_LABEL', 'AUTH_DATA', 'BOOTSTRAP_LABELS') and name:
+                              'STANDBY_LEADER_LABEL_VALUE', 'TMP_ROLE_LABEL', 'AUTH_DATA',
+                              'BOOTSTRAP_LABELS') and name:
                     value = os.environ.pop(param)
                     if name == 'CITUS':
                         if suffix == 'GROUP':
@@ -702,7 +703,8 @@ class Config(object):
                     elif suffix in ('USE_PROXIES', 'REGISTER_SERVICE', 'USE_ENDPOINTS', 'BYPASS_API_SERVICE', 'VERIFY'):
                         value = parse_bool(value)
                     if value is not None:
-                        ret[name.lower()][suffix.lower()] = value
+                        key = 'nomad_namespace' if name == 'NOMAD' and suffix == 'NAMESPACE' else suffix.lower()
+                        ret[name.lower()][key] = value
         for dcs in ('etcd', 'etcd3'):
             if dcs in ret:
                 ret[dcs].update(_get_auth(dcs))

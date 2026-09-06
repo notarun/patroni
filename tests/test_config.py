@@ -69,6 +69,8 @@ class TestConfig(unittest.TestCase):
             'PATRONI_ETCD_KEY': '/key',
             'PATRONI_CONSUL_HOST': '127.0.0.1:8500',
             'PATRONI_CONSUL_REGISTER_SERVICE': 'on',
+            'PATRONI_NOMAD_HOST': '127.0.0.1:4646',
+            'PATRONI_NOMAD_NAMESPACE': 'default',
             'PATRONI_KUBERNETES_LABELS': 'a: b: c',
             'PATRONI_KUBERNETES_SCOPE_LABEL': 'a',
             'PATRONI_KUBERNETES_PORTS': '[{"name": "postgresql"}]',

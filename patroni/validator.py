@@ -166,6 +166,11 @@ def validate_host_port(host_port: str, listen: bool = False, multiple_hosts: boo
     return True
 
 
+def validate_nomad_host(value: str) -> bool:
+    """Validate a Nomad TCP address or an absolute Unix socket path."""
+    return True if os.path.isabs(value) else validate_host_port(value)
+
+
 def validate_host_port_list(value: List[str]) -> bool:
     """Validate a list of host(s) and port items.
 
@@ -1197,6 +1202,20 @@ schema = Schema({
             Optional("service_check_tls_server_name"): str,
             Optional("consistency"): EnumValidator(('default', 'consistent', 'stale'),
                                                    case_sensitive=True, raise_assert=True)
+        },
+        "nomad": {
+            Or("host", "url"): Case({
+                "host": validate_nomad_host,
+                "url": str
+            }),
+            Optional("port"): IntValidator(max=65535, expected_type=int, raise_assert=True),
+            Optional("scheme"): str,
+            Optional("token"): str,
+            Optional("verify"): bool,
+            Optional("cacert"): str,
+            Optional("cert"): str,
+            Optional("key"): str,
+            Optional("nomad_namespace"): str,
         },
         "etcd": validate_etcd,
         "etcd3": validate_etcd,

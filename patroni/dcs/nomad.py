@@ -1,0 +1,457 @@
+import json
+import logging
+import os
+import re
+import time
+
+from collections import defaultdict
+from typing import Any, Callable, cast, Dict, List, Mapping, Optional, Tuple, TYPE_CHECKING, Union
+from urllib.parse import quote, urlparse
+
+import requests
+import requests_unixsocket
+
+from ..exceptions import DCSError
+from ..postgresql.mpp import AbstractMPP
+from ..utils import parse_bool, parse_int, Retry, RetryFailedError, split_host_port, uri, USER_AGENT
+from . import AbstractDCS, Cluster, ClusterConfig, Failover, Leader, Member, Status, SyncState, TimelineHistory
+
+if TYPE_CHECKING:  # pragma: no cover
+    from ..config import Config
+
+logger = logging.getLogger(__name__)
+
+
+class NomadError(DCSError):
+    pass
+
+
+class NomadConflict(Exception):
+    pass
+
+
+class NomadNotFound(Exception):
+    pass
+
+
+class NomadClient(object):
+
+    LOCK_DELAY = 10
+
+    def __init__(self, host: str = '127.0.0.1', port: int = 4646, token: Optional[str] = None,
+                 scheme: str = 'http', verify: bool = True, cert: Optional[str] = None,
+                 key: Optional[str] = None, cacert: Optional[str] = None, namespace: Optional[str] = None,
+                 unix_socket: Optional[str] = None) -> None:
+        self.base_uri = 'http+unix://' + quote(unix_socket, safe='') if unix_socket else uri(scheme, (host, port))
+        self.namespace = namespace
+        self._read_timeout = 10.0
+        self.session = requests_unixsocket.Session() if unix_socket else requests.Session()
+        # DCS traffic must not be redirected through ambient proxy settings.
+        self.session.trust_env = False
+        self.session.headers['User-Agent'] = USER_AGENT
+        if token:
+            self.session.headers['X-Nomad-Token'] = token
+        self.session.verify = cacert or verify
+        self.session.cert = (cert, key) if cert and key else cert
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any]) -> 'NomadClient':
+        host, port = '127.0.0.1', 4646
+        scheme_value = config.get('scheme')
+        scheme = scheme_value if isinstance(scheme_value, str) else 'http'
+        if scheme not in ('http', 'https'):
+            raise ValueError('Nomad scheme must be http or https')
+        url = config.get('url')
+        host_value = config.get('host')
+        if isinstance(url, str) and url:
+            parsed = urlparse(url)
+            if parsed.scheme == 'unix' and parsed.path.startswith('/') and not any(
+                    (parsed.netloc, parsed.params, parsed.query, parsed.fragment)):
+                host = parsed.path
+            elif parsed.scheme not in ('http', 'https') or not parsed.hostname \
+                    or parsed.username or parsed.password or parsed.path not in ('', '/') \
+                    or parsed.params or parsed.query or parsed.fragment:
+                raise ValueError('Invalid Nomad URL')
+            else:
+                scheme, host, port = parsed.scheme, parsed.hostname, parsed.port or 4646
+        elif isinstance(host_value, str) and host_value:
+            if host_value.startswith('/'):
+                host = host_value
+            else:
+                host, parsed_port = split_host_port(host_value, 4646)
+                port = int(config.get('port', parsed_port))
+        elif config.get('port'):
+            port = int(config['port'])
+
+        tcp_options = ('port', 'scheme', 'verify', 'cacert', 'cert', 'key')
+        if host.startswith('/') and any(name in config for name in tcp_options):
+            raise ValueError('Nomad TCP and TLS settings can not be used with a Unix socket')
+
+        verify = config.get('verify', True)
+        if not isinstance(verify, bool):
+            verify = parse_bool(verify)
+        return cls(host=host, port=port, scheme=scheme, token=config.get('token'), verify=verify is not False,
+                   cert=config.get('cert'), key=config.get('key'), cacert=config.get('cacert'),
+                   namespace=config.get('nomad_namespace'), unix_socket=host if host.startswith('/') else None)
+
+    def close(self) -> None:
+        self.session.close()
+
+    def set_read_timeout(self, timeout: float) -> None:
+        self._read_timeout = timeout / 3.0
+
+    def _request(self, method: str, endpoint: str, params: Optional[Mapping[str, Any]] = None,
+                 body: Optional[Dict[str, Any]] = None,
+                 deadline: Optional[float] = None) -> Tuple[Any, Mapping[str, str]]:
+        query = dict(params or {})
+        if self.namespace:
+            query['namespace'] = self.namespace
+        timeout = self._read_timeout
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.monotonic())
+            if timeout <= 0:
+                raise NomadError('Nomad request deadline exceeded')
+        try:
+            # Redirects could disclose the Nomad token to an untrusted endpoint.
+            response = self.session.request(method, self.base_uri + endpoint, params=query, json=body, timeout=timeout,
+                                            allow_redirects=False)
+        except requests.RequestException as e:
+            raise NomadError(str(e))
+        if response.status_code == 404:
+            raise NomadNotFound(response.text)
+        if response.status_code == 409:
+            raise NomadConflict(response.text)
+        if response.status_code < 200 or response.status_code >= 300:
+            raise NomadError('{0}: {1}'.format(response.status_code, response.text))
+        if not response.content:
+            return True, response.headers
+        try:
+            return response.json(), response.headers
+        except ValueError as e:
+            raise NomadError('Invalid response from Nomad: {0}'.format(e))
+
+    @staticmethod
+    def _path(path: str) -> str:
+        return quote(path.lstrip('/'), safe='/~')
+
+    def get_variable(self, path: str, deadline: Optional[float] = None) -> Dict[str, Any]:
+        return self._request('GET', '/v1/var/' + self._path(path), deadline=deadline)[0]
+
+    def list_variables(self, prefix: str, deadline: Optional[float] = None) -> List[Dict[str, Any]]:
+        return self._request('GET', '/v1/vars', {'prefix': prefix}, deadline=deadline)[0]
+
+    def put_variable(self, path: str, value: str, cas: Optional[int] = None) -> Dict[str, Any]:
+        params = {'cas': cas} if cas is not None else None
+        return self._request('PUT', '/v1/var/' + self._path(path), params, {'Items': {'value': value}})[0]
+
+    def delete_variable(self, path: str, cas: Optional[int] = None) -> bool:
+        params = {'cas': cas} if cas is not None else None
+        return bool(self._request('DELETE', '/v1/var/' + self._path(path), params)[0])
+
+    def acquire_lock(self, path: str, value: str, ttl: int, lock_id: Optional[str] = None) -> Dict[str, Any]:
+        body = {'Items': {'value': value},
+                'Lock': {'TTL': '{0}s'.format(ttl), 'LockDelay': '{0}s'.format(self.LOCK_DELAY)}}
+        if lock_id:
+            body['Lock']['ID'] = lock_id
+        return self._request('PUT', '/v1/var/' + self._path(path), {'lock-acquire': ''}, body)[0]
+
+    def renew_lock(self, path: str, lock_id: str) -> Dict[str, Any]:
+        body = {'Lock': {'ID': lock_id}}
+        return self._request('PUT', '/v1/var/' + self._path(path), {'lock-renew': ''}, body)[0]
+
+    def release_lock(self, path: str, lock_id: str) -> Dict[str, Any]:
+        body = {'Lock': {'ID': lock_id}}
+        return self._request('PUT', '/v1/var/' + self._path(path), {'lock-release': ''}, body)[0]
+
+
+def catch_nomad_errors(func: Callable[..., Any]) -> Callable[..., Any]:
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(*args, **kwargs)
+        except (NomadError, NomadConflict, NomadNotFound, RetryFailedError):
+            return False
+    return wrapper
+
+
+class Nomad(AbstractDCS):
+
+    def __init__(self, config: Dict[str, Any], mpp: AbstractMPP) -> None:
+        super(Nomad, self).__init__(config, mpp)
+        # Nomad variable paths are relative and reject a leading slash.
+        self._base_path = self._base_path[1:]
+        self._retry = Retry(deadline=config['retry_timeout'], max_delay=1, max_tries=-1,
+                            retry_exceptions=NomadError)
+        self._ttl = 30
+        self._member_lock: Optional[str] = None
+        self._leader_lock: Optional[str] = None
+        self._member_lock_ttl: Optional[int] = None
+        self._leader_lock_ttl: Optional[int] = None
+        self._member_value: Optional[str] = None
+
+        paths = (self.initialize_path, self.config_path, self.leader_path, self.failover_path, self.history_path,
+                 self.member_path, self.status_path, self.leader_optime_path, self.sync_path, self.failsafe_path)
+        if any(len(path.encode('utf-8')) > 128 or not re.match(r'^[a-zA-Z0-9-_~/]+$', path)
+               or path.startswith('nomad/') for path in paths):
+            raise ValueError('Patroni namespace, scope, and name must form valid non-reserved Nomad variable paths')
+
+        self._client = NomadClient.from_config(config)
+        self.set_retry_timeout(config['retry_timeout'])
+        self.set_ttl(config.get('ttl') or 30)
+
+    def reload_config(self, config: Union['Config', Dict[str, Any]]) -> None:
+        super(Nomad, self).reload_config(config)
+        nomad_config = config.get('nomad')
+        if nomad_config:
+            old_client = self._client
+            self._client = NomadClient.from_config(nomad_config)
+            self._client.set_read_timeout(config['retry_timeout'])
+            old_client.close()
+
+    def set_ttl(self, ttl: int) -> Optional[bool]:
+        if ttl < 10 or ttl > 86400:
+            raise ValueError('Nomad lock TTL must be between 10 and 86400 seconds')
+        changed = self._ttl != ttl
+        self._ttl = ttl
+        if changed:
+            self.event.set()
+        return changed
+
+    @property
+    def ttl(self) -> int:
+        return self._leader_lock_ttl if self._leader_lock and self._leader_lock_ttl else self._ttl
+
+    def set_retry_timeout(self, retry_timeout: int) -> None:
+        self._retry.deadline = retry_timeout
+        self._client.set_read_timeout(retry_timeout)
+
+    @staticmethod
+    def _nested(node: Optional[Dict[str, Any]], key: str) -> Mapping[str, Any]:
+        value = node and node.get(key)
+        return cast(Mapping[str, Any], value) if isinstance(value, dict) else {}
+
+    @classmethod
+    def _value(cls, node: Optional[Dict[str, Any]]) -> Optional[str]:
+        value = cls._nested(node, 'Items').get('value')
+        return value if isinstance(value, str) else None
+
+    @classmethod
+    def _lock_id(cls, node: Optional[Dict[str, Any]]) -> Optional[str]:
+        value = cls._nested(node, 'Lock').get('ID')
+        return value if isinstance(value, str) else None
+
+    @staticmethod
+    def _index(node: Dict[str, Any]) -> int:
+        value = node.get('ModifyIndex')
+        return value if isinstance(value, int) else 0
+
+    @classmethod
+    def _lock_setting(cls, node: Optional[Dict[str, Any]], name: str) -> Optional[int]:
+        return parse_int(cls._nested(node, 'Lock').get(name), 's')
+
+    @classmethod
+    def member(cls, node: Dict[str, Any]) -> Member:
+        return Member.from_node(cls._index(node), os.path.basename(node['Path']),
+                                cls._lock_id(node), cls._value(node) or '')
+
+    def _cluster_from_nodes(self, nodes: Dict[str, Dict[str, Any]]) -> Cluster:
+        initialize = self._value(nodes.get(self._INITIALIZE))
+        config_node = nodes.get(self._CONFIG)
+        config = config_node and ClusterConfig.from_node(self._index(config_node), self._value(config_node) or '')
+        history_node = nodes.get(self._HISTORY)
+        history = history_node and TimelineHistory.from_node(self._index(history_node), self._value(history_node) or '')
+        status = Status.from_node(self._value(nodes.get(self._STATUS) or nodes.get(self._LEADER_OPTIME)))
+        members = [self.member(node) for key, node in nodes.items()
+                   if key.startswith(self._MEMBERS) and key.count('/') == 1 and self._lock_id(node)]
+
+        leader_node = nodes.get(self._LEADER)
+        leader = None
+        if leader_node and self._lock_id(leader_node):
+            leader_name = self._value(leader_node) or ''
+            if leader_name == self._name:
+                self._leader_lock_ttl = self._lock_setting(leader_node, 'TTL')
+            member = next((item for item in members if item.name == leader_name),
+                          Member(-1, leader_name, None, {}))
+            leader = Leader(self._index(leader_node), self._lock_id(leader_node), member)
+
+        failover_node = nodes.get(self._FAILOVER)
+        failover = failover_node and Failover.from_node(self._index(failover_node), self._value(failover_node) or '')
+        sync_node = nodes.get(self._SYNC)
+        sync = SyncState.from_node(self._index(sync_node) if sync_node else None, self._value(sync_node))
+        failsafe_node = nodes.get(self._FAILSAFE)
+        try:
+            failsafe = json.loads(self._value(failsafe_node) or '') if failsafe_node else None
+        except (TypeError, ValueError):
+            failsafe = None
+
+        own_member = nodes.get(self._MEMBERS + self._name)
+        if own_member and self._lock_id(own_member):
+            self._member_lock_ttl = self._lock_setting(own_member, 'TTL')
+        return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe)
+
+    def _load_nodes(self, path: str, deadline: float) -> Dict[str, Dict[str, Any]]:
+        nodes: Dict[str, Dict[str, Any]] = {}
+        for metadata in self._client.list_variables(path, deadline):
+            variable_path = metadata['Path']
+            try:
+                node = self._client.get_variable(variable_path, deadline)
+            except NomadNotFound:
+                # Variables may disappear between the list and get requests.
+                continue
+            nodes[variable_path[len(path):]] = node
+        return nodes
+
+    def _postgresql_cluster_loader(self, path: str) -> Cluster:
+        deadline = time.monotonic() + float(self._retry.deadline or 0)
+        return self._cluster_from_nodes(self._retry.copy()(self._load_nodes, path, deadline))
+
+    def _mpp_cluster_loader(self, path: str) -> Dict[int, Cluster]:
+        clusters: Dict[int, Dict[str, Dict[str, Any]]] = defaultdict(dict)
+        deadline = time.monotonic() + float(self._retry.deadline or 0)
+        for key, node in self._retry.copy()(self._load_nodes, path, deadline).items():
+            parts = key.split('/', 1)
+            if len(parts) == 2 and self._mpp.group_re.match(parts[0]):
+                clusters[int(parts[0])][parts[1]] = node
+        return {group: self._cluster_from_nodes(nodes) for group, nodes in clusters.items()}
+
+    def _load_cluster(self, path: str, loader: Callable[[str], Union[Cluster, Dict[int, Cluster]]]
+                      ) -> Union[Cluster, Dict[int, Cluster]]:
+        try:
+            return loader(path)
+        except (NomadError, RetryFailedError) as e:
+            logger.exception('get_cluster')
+            raise NomadError('Nomad is not responding properly: {0}'.format(e))
+
+    @catch_nomad_errors
+    def touch_member(self, data: Dict[str, Any]) -> bool:
+        value = json.dumps(data, separators=(',', ':'))
+        if not self._member_lock:
+            # Preserve lock ownership across Patroni restarts within the lock TTL.
+            member = self.cluster and self.cluster.get_member(self._name, fallback_to_leader=False)
+            if member and isinstance(member.session, str):
+                self._member_lock = member.session
+                self._member_value = json.dumps(member.data, separators=(',', ':'))
+        if not self._member_lock:
+            result = self._client.acquire_lock(self.member_path, value, self._ttl)
+            self._member_lock = self._lock_id(result)
+            self._member_lock_ttl = self._ttl
+            self._member_value = value
+            return bool(self._member_lock)
+        try:
+            self._client.renew_lock(self.member_path, self._member_lock)
+            if value != self._member_value:
+                # Renewing a Nomad lock does not update its variable items.
+                self._client.acquire_lock(self.member_path, value, self._member_lock_ttl or self._ttl,
+                                          self._member_lock)
+                self._member_value = value
+            return True
+        except (NomadConflict, NomadNotFound):
+            self._member_lock = self._member_value = None
+            self._member_lock_ttl = None
+            return False
+
+    def attempt_to_acquire_leader(self) -> bool:
+        try:
+            result = self._retry.copy()(self._client.acquire_lock, self.leader_path, self._name,
+                                        self._ttl)
+            self._leader_lock = self._lock_id(result)
+            self._leader_lock_ttl = self._ttl
+            return bool(self._leader_lock)
+        except NomadConflict:
+            logger.info('Could not take out TTL lock')
+            return False
+        except RetryFailedError as e:
+            raise NomadError(e)
+
+    def take_leader(self) -> bool:
+        return self.attempt_to_acquire_leader()
+
+    def _update_leader(self, leader: Leader) -> bool:
+        if not self._leader_lock and leader.name == self._name and isinstance(leader.session, str):
+            # Recover a still-valid leader lock after Patroni restarts.
+            self._leader_lock = leader.session
+        if not self._leader_lock or leader.session != self._leader_lock or leader.name != self._name:
+            return False
+        try:
+            self._retry.copy()(self._client.renew_lock, self.leader_path, self._leader_lock)
+            return True
+        except (NomadConflict, NomadNotFound):
+            self._leader_lock = None
+            self._leader_lock_ttl = None
+            return False
+        except RetryFailedError as e:
+            raise NomadError(e)
+
+    @catch_nomad_errors
+    def set_failover_value(self, value: str, version: Optional[int] = None) -> bool:
+        return bool(self._client.put_variable(self.failover_path, value, version))
+
+    @catch_nomad_errors
+    def set_config_value(self, value: str, version: Optional[int] = None) -> bool:
+        return bool(self._client.put_variable(self.config_path, value, version))
+
+    @catch_nomad_errors
+    def _write_leader_optime(self, last_lsn: str) -> bool:
+        return bool(self._client.put_variable(self.leader_optime_path, last_lsn))
+
+    @catch_nomad_errors
+    def _write_status(self, value: str) -> bool:
+        return bool(self._client.put_variable(self.status_path, value))
+
+    @catch_nomad_errors
+    def _write_failsafe(self, value: str) -> bool:
+        return bool(self._client.put_variable(self.failsafe_path, value))
+
+    @catch_nomad_errors
+    def initialize(self, create_new: bool = True, sysid: str = '') -> bool:
+        return bool(self._retry.copy()(self._client.put_variable, self.initialize_path, sysid,
+                                       0 if create_new else None))
+
+    @catch_nomad_errors
+    def cancel_initialization(self) -> bool:
+        return self._retry.copy()(self._client.delete_variable, self.initialize_path)
+
+    @catch_nomad_errors
+    def delete_cluster(self) -> bool:
+        retry = self._retry.copy()
+
+        def delete_all() -> bool:
+            for metadata in self._client.list_variables(self.client_path('')):
+                try:
+                    node = self._client.get_variable(metadata['Path'])
+                except NomadNotFound:
+                    continue
+                lock_id = self._lock_id(node)
+                if lock_id:
+                    node = self._client.release_lock(node['Path'], lock_id)
+                self._client.delete_variable(metadata['Path'], node.get('ModifyIndex'))
+            return True
+
+        return retry(delete_all)
+
+    @catch_nomad_errors
+    def set_history_value(self, value: str) -> bool:
+        return bool(self._client.put_variable(self.history_path, value))
+
+    @catch_nomad_errors
+    def _delete_leader(self, leader: Leader) -> bool:
+        if not self._leader_lock or leader.session != self._leader_lock or leader.name != self._name:
+            return False
+        result = self._client.release_lock(self.leader_path, self._leader_lock)
+        self._leader_lock = None
+        self._leader_lock_ttl = None
+        return self._client.delete_variable(self.leader_path, result['ModifyIndex'])
+
+    @catch_nomad_errors
+    def set_sync_state_value(self, value: str, version: Optional[int] = None) -> Union[int, bool]:
+        result = self._client.put_variable(self.sync_path, value, version)
+        return result['ModifyIndex']
+
+    @catch_nomad_errors
+    def delete_sync_state(self, version: Optional[int] = None) -> bool:
+        return self._client.delete_variable(self.sync_path, version)
+
+    def watch(self, leader_version: Optional[Any], timeout: float) -> bool:
+        try:
+            return super(Nomad, self).watch(leader_version, timeout)
+        finally:
+            self.event.clear()
