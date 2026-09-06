@@ -71,7 +71,8 @@ run:
 YAML Configuration
 ------------------
 
-Go :ref:`here <yaml_configuration>` for comprehensive information about DCS settings. And for an example, see `postgres0.yml <https://github.com/patroni/patroni/blob/master/postgres0.yml>`__.
+Go :ref:`here <yaml_configuration>` for comprehensive information about settings for etcd, consul, Nomad, and
+ZooKeeper. And for an example, see `postgres0.yml <https://github.com/patroni/patroni/blob/master/postgres0.yml>`__.
 
 
 Environment Configuration
