@@ -36,13 +36,14 @@ class NomadNotFound(Exception):
 
 class NomadClient(object):
 
+    LOCK_DELAY = 10
+
     def __init__(self, host: str = '127.0.0.1', port: int = 4646, token: Optional[str] = None,
                  scheme: str = 'http', verify: bool = True, cert: Optional[str] = None,
                  key: Optional[str] = None, cacert: Optional[str] = None, namespace: Optional[str] = None,
-                 region: Optional[str] = None, unix_socket: Optional[str] = None) -> None:
+                 unix_socket: Optional[str] = None) -> None:
         self.base_uri = 'http+unix://' + quote(unix_socket, safe='') if unix_socket else uri(scheme, (host, port))
         self.namespace = namespace
-        self.region = region
         self._read_timeout = 10.0
         self.session = requests_unixsocket.Session() if unix_socket else requests.Session()
         self.session.trust_env = False
@@ -64,8 +65,6 @@ class NomadClient(object):
         query = dict(params or {})
         if self.namespace:
             query['namespace'] = self.namespace
-        if self.region:
-            query['region'] = self.region
         timeout = self._read_timeout
         if deadline is not None:
             timeout = min(timeout, deadline - time.monotonic())
@@ -115,10 +114,9 @@ class NomadClient(object):
         params = {'cas': cas} if cas is not None else None
         return bool(self._request('DELETE', '/v1/var/' + self._path(path), params)[0])
 
-    def acquire_lock(self, path: str, value: str, ttl: int, lock_delay: int,
-                     lock_id: Optional[str] = None) -> Dict[str, Any]:
+    def acquire_lock(self, path: str, value: str, ttl: int, lock_id: Optional[str] = None) -> Dict[str, Any]:
         body = {'Items': {'value': value},
-                'Lock': {'TTL': '{0}s'.format(ttl), 'LockDelay': '{0}s'.format(lock_delay)}}
+                'Lock': {'TTL': '{0}s'.format(ttl), 'LockDelay': '{0}s'.format(self.LOCK_DELAY)}}
         if lock_id:
             body['Lock']['ID'] = lock_id
         return self._request('PUT', '/v1/var/' + self._path(path), {'lock-acquire': ''}, body)[0]
@@ -149,13 +147,9 @@ class Nomad(AbstractDCS):
         self._retry = Retry(deadline=config['retry_timeout'], max_delay=1, max_tries=-1,
                             retry_exceptions=NomadError)
         self._ttl = 30
-        self._lock_delay = int(config.get('lock_delay', 10))
-        if self._lock_delay < 10 or self._lock_delay > 86400:
-            raise ValueError('Nomad lock delay must be between 10 and 86400 seconds')
         self._member_lock: Optional[str] = None
         self._leader_lock: Optional[str] = None
         self._member_lock_ttl: Optional[int] = None
-        self._member_lock_delay: Optional[int] = None
         self._leader_lock_ttl: Optional[int] = None
         self._member_value: Optional[str] = None
 
@@ -208,16 +202,12 @@ class Nomad(AbstractDCS):
         return NomadClient(host=host, port=port, scheme=scheme, token=config.get('token'),
                            verify=verify is not False, cert=config.get('cert'), key=config.get('key'),
                            cacert=config.get('cacert'), namespace=config.get('nomad_namespace'),
-                           region=config.get('region'), unix_socket=host if host.startswith('/') else None)
+                           unix_socket=host if host.startswith('/') else None)
 
     def reload_config(self, config: Union['Config', Dict[str, Any]]) -> None:
         super(Nomad, self).reload_config(config)
         nomad_config = config.get('nomad')
         if nomad_config:
-            lock_delay = int(nomad_config.get('lock_delay', 10))
-            if lock_delay < 10 or lock_delay > 86400:
-                raise ValueError('Nomad lock delay must be between 10 and 86400 seconds')
-            self._lock_delay = lock_delay
             old_client = self._client
             self._client = self._create_client(nomad_config)
             self._client.set_read_timeout(config['retry_timeout'])
@@ -302,7 +292,6 @@ class Nomad(AbstractDCS):
         own_member = nodes.get(self._MEMBERS + self._name)
         if own_member and self._lock_id(own_member):
             self._member_lock_ttl = self._lock_setting(own_member, 'TTL')
-            self._member_lock_delay = self._lock_setting(own_member, 'LockDelay')
         return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe)
 
     def _load_nodes(self, path: str, deadline: float) -> Dict[str, Dict[str, Any]]:
@@ -346,28 +335,27 @@ class Nomad(AbstractDCS):
                 self._member_lock = member.session
                 self._member_value = json.dumps(member.data, separators=(',', ':'))
         if not self._member_lock:
-            result = self._client.acquire_lock(self.member_path, value, self._ttl, self._lock_delay)
+            result = self._client.acquire_lock(self.member_path, value, self._ttl)
             self._member_lock = self._lock_id(result)
             self._member_lock_ttl = self._ttl
-            self._member_lock_delay = self._lock_delay
             self._member_value = value
             return bool(self._member_lock)
         try:
             self._client.renew_lock(self.member_path, self._member_lock)
             if value != self._member_value:
                 self._client.acquire_lock(self.member_path, value, self._member_lock_ttl or self._ttl,
-                                          self._member_lock_delay or self._lock_delay, self._member_lock)
+                                          self._member_lock)
                 self._member_value = value
             return True
         except (NomadConflict, NomadNotFound):
             self._member_lock = self._member_value = None
-            self._member_lock_ttl = self._member_lock_delay = None
+            self._member_lock_ttl = None
             return False
 
     def attempt_to_acquire_leader(self) -> bool:
         try:
             result = self._retry.copy()(self._client.acquire_lock, self.leader_path, self._name,
-                                        self._ttl, self._lock_delay)
+                                        self._ttl)
             self._leader_lock = self._lock_id(result)
             self._leader_lock_ttl = self._ttl
             return bool(self._leader_lock)

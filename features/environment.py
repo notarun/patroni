@@ -502,7 +502,6 @@ class NomadController(AbstractDcsController):
     def __init__(self, context):
         super(NomadController, self).__init__(context)
         os.environ['PATRONI_NOMAD_HOST'] = 'localhost:4646'
-        os.environ['PATRONI_NOMAD_LOCK_DELAY'] = '10'
         import requests
         self._client = requests.Session()
 

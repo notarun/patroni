@@ -147,10 +147,8 @@ Patroni uses the Nomad Variables API and variable locks. Nomad 1.7 or newer is r
 -  **cacert**: (optional) CA certificate used for TLS validation.
 -  **cert**: (optional) client certificate file.
 -  **key**: (optional) client key file.
--  **region**: (optional) Nomad region used for every request.
 -  **nomad_namespace**: (optional) Nomad ACL namespace. This is distinct from Patroni's top-level **namespace**, which
    controls the Variables path prefix.
--  **lock_delay**: (optional) lock delay in seconds, from ``10`` through ``86400``. Defaults to ``10``.
 
 Patroni stores each DCS key in a separate Nomad variable and uses locks for leader and member variables. Nomad leaves
 the variable and its items behind when a lock expires, so Patroni determines liveness from the variable's ``Lock``
@@ -159,9 +157,9 @@ field. With Nomad ACLs enabled this field is redacted for ordinary variable toke
 use a management token. ACL-disabled Nomad agents also expose the field. Do not use a regular workload token: stale
 leaders and members cannot be distinguished safely.
 
-The token also requires list, read, write, and destroy access to the Patroni variable prefix. Lock TTL and lock delay
-must be included when sizing failover time. Nomad lock parameters are immutable after acquisition, so a dynamic TTL
-change applies when Patroni next acquires a lock.
+The token also requires list, read, write, and destroy access to the Patroni variable prefix. Patroni uses a fixed
+10-second lock delay, which must be included when sizing failover time. Nomad lock parameters are immutable after
+acquisition, so a dynamic TTL change applies when Patroni next acquires a lock.
 
 Etcd
 ----

@@ -42,7 +42,7 @@ def variable(path: str, value: str = '', index: int = 1, lock_id: Optional[str] 
 class TestNomadClient(unittest.TestCase):
 
     def setUp(self) -> None:
-        self.client = NomadClient(token='secret', namespace='testing', region='global')
+        self.client = NomadClient(token='secret', namespace='testing')
         self.request = Mock()
         setattr(self.client.session, 'request', self.request)
 
@@ -66,7 +66,7 @@ class TestNomadClient(unittest.TestCase):
         args, kwargs = request
         self.assertEqual(args[0], 'PUT')
         self.assertIn('/v1/var/service/a%20b/config', args[1])
-        self.assertEqual(kwargs['params'], {'cas': 1, 'namespace': 'testing', 'region': 'global'})
+        self.assertEqual(kwargs['params'], {'cas': 1, 'namespace': 'testing'})
         self.assertEqual(self.client.session.headers['X-Nomad-Token'], 'secret')
         self.assertEqual(kwargs['json'], {'Items': {'value': '{}'}})
         self.assertEqual(kwargs['timeout'], 10)
@@ -87,7 +87,7 @@ class TestNomadClient(unittest.TestCase):
 
     def test_lock_requests(self):
         self.request.return_value = self.response(data=b'{"Lock":{"ID":"123"}}')
-        self.assertEqual(self.client.acquire_lock('leader', 'node1', 30, 10)['Lock']['ID'], '123')
+        self.assertEqual(self.client.acquire_lock('leader', 'node1', 30)['Lock']['ID'], '123')
         request = self.request.call_args
         assert request is not None
         self.assertEqual(request.kwargs['params']['lock-acquire'], '')
@@ -104,7 +104,7 @@ class TestNomadClient(unittest.TestCase):
         self.assertIn('lock-release', request.kwargs['params'])
         self.assertNotIn('Items', body)
 
-        self.client.acquire_lock('leader', 'node1', 30, 10, '123')
+        self.client.acquire_lock('leader', 'node1', 30, '123')
         request = self.request.call_args
         assert request is not None
         self.assertEqual(request.kwargs['json']['Lock']['ID'], '123')
@@ -153,10 +153,6 @@ class NomadForTests(Nomad):
     @property
     def nomad_client(self) -> NomadClient:
         return self._client
-
-    @property
-    def lock_delay(self) -> int:
-        return self._lock_delay
 
     def set_client(self, client: NomadClient) -> None:
         self._client = client
@@ -262,7 +258,7 @@ class TestNomad(unittest.TestCase):
         self.assertTrue(self.c.touch_member(changed))
         self.client.acquire_lock.assert_called_with(self.c.member_path,
                                                     json.dumps(changed, separators=(',', ':')),
-                                                    30, 10, 'member-lock')
+                                                    30, 'member-lock')
 
         self.client.renew_lock.side_effect = NomadConflict('lost')
         self.assertFalse(self.c.touch_member(changed))
@@ -339,10 +335,9 @@ class TestNomad(unittest.TestCase):
 
     def test_reload_config(self):
         self.c.reload_config({'loop_wait': 5, 'ttl': 30, 'retry_timeout': 6,
-                              'nomad': {'url': 'https://nomad.example:4647', 'token': 'new', 'lock_delay': 11}})
+                              'nomad': {'url': 'https://nomad.example:4647', 'token': 'new'}})
         self.assertEqual(self.c.nomad_client.base_uri, 'https://nomad.example:4647')
         self.assertEqual(self.c.nomad_client.session.headers['X-Nomad-Token'], 'new')
-        self.assertEqual(self.c.lock_delay, 11)
 
     def test_unix_socket_config(self):
         for config in ({'host': '/secrets/api.sock'}, {'url': 'unix:///secrets/api.sock'},
